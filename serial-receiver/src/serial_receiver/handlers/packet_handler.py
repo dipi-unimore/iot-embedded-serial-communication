@@ -27,7 +27,18 @@ class PacketHandler(ABC):
         - An exception doesn't stop the receiver: PacketDispatcher logs it and
           moves on to the next handler and the next packet.
         - The Packet and its DTO are frozen. Treat them as read-only.
+        - packet.number and packet.received_at_ms are set by the Receiver
+          (per-type sequence number, receive time in ms since the epoch).
+
+    Override close() if the handler holds resources (see MqttPacketHandler).
     """
 
     @abstractmethod
     def handle(self, packet: Packet) -> None: ...
+
+    def close(self) -> None:
+        """Releases resources (connections, files) at shutdown. Default: nothing to do.
+
+        Called once per instance by PacketDispatcher.close(), even if the instance
+        is bound to several packet types. No handle() call follows it.
+        """

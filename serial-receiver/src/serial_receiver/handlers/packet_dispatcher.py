@@ -36,6 +36,21 @@ class PacketDispatcher:
         """A copy of the handlers bound to `packet_type`, in call order."""
         return list(self._handlers.get(packet_type, ()))
 
+    def close(self) -> None:
+        """Calls close() on every distinct handler once, even if it's registered for
+        several packet types (e.g. one shared MQTT connection). A failing close()
+        is logged and doesn't prevent the others from closing."""
+        seen: set[int] = set()
+        for handlers in self._handlers.values():
+            for handler in handlers:
+                if id(handler) in seen:
+                    continue
+                seen.add(id(handler))
+                try:
+                    handler.close()
+                except Exception:
+                    log.exception("%s failed to close", type(handler).__name__)
+
     def dispatch(self, packet: Packet) -> None:
         """Calls handle(packet) on each handler bound to packet.packet_type,
         synchronously, on the caller's thread (the Receiver's read loop)."""

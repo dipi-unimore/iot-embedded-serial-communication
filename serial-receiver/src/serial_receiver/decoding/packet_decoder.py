@@ -61,11 +61,14 @@ class PacketDecoder:
             )
         return Packet(packet_type, dto_cls.from_bytes(fields))
 
-    def encode(self, packet: Packet) -> bytes:
+    @staticmethod
+    def encode(packet: Packet) -> bytes:
         """Builds the payload (before COBS) with its CRC: the inverse of decode().
 
-        Used by the tests and the basis for a future PC -> device sender:
-        cobs.encode(decoder.encode(packet)) + b"\\x00" is a complete wire frame.
+        Static because it needs no registry: the DTO carries its own layout. Used by
+        the tests, by serialization.BinaryPayloadEncoder, and the basis for a future
+        PC -> device sender: cobs.encode(PacketDecoder.encode(packet)) + b"\\x00" is
+        a complete wire frame.
         """
         body = bytes([packet.packet_type]) + packet.dto.to_bytes()
         return body + _CRC.pack(crc16_ccitt(body))

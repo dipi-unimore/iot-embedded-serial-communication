@@ -59,3 +59,31 @@ def test_logging_handler_logs_dto_at_configured_level(caplog):
 def test_logging_handler_rejects_unknown_level():
     with pytest.raises(ValueError):
         LoggingPacketHandler(level="LOUD")
+
+
+class ClosingHandler(PacketHandler):
+    def __init__(self, fail: bool = False) -> None:
+        self.closed = 0
+        self._fail = fail
+
+    def handle(self, packet: Packet) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed += 1
+        if self._fail:
+            raise RuntimeError("boom")
+
+
+def test_close_closes_each_distinct_handler_once_even_if_one_fails(caplog):
+    shared, failing, other = ClosingHandler(), ClosingHandler(fail=True), ClosingHandler()
+    dispatcher = PacketDispatcher()
+    dispatcher.register(0x01, shared)
+    dispatcher.register(0x02, shared)
+    dispatcher.register(0x01, failing)
+    dispatcher.register(0x02, other)
+
+    dispatcher.close()
+
+    assert (shared.closed, failing.closed, other.closed) == (1, 1, 1)
+    assert "ClosingHandler failed to close" in caplog.text

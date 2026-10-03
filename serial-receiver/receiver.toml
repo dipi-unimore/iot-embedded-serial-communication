@@ -8,16 +8,45 @@ baud = 921600                        # must match the sender's baud rate
 [stats]
 interval_s = 5.0                     # how often to log throughput/error stats, 0 to disable
 
+# ---------------------------------------------------------------------------------------------
+# Named handlers: each [handlers.<name>] is created once, on first use, and shared by every
+# [[packets]] block that lists its name (e.g. one MQTT connection for all packet types).
+#   class   : "package.module:Class" of a PacketHandler subclass
+#   options : constructor keyword arguments
+# ---------------------------------------------------------------------------------------------
+[handlers.log]
+class = "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler"
+[handlers.log.options]
+level = "INFO"
+
+# Publishes every packet to an MQTT broker. Uncomment, adjust, and add "mqtt" to the
+# `handlers` of the [[packets]] blocks to publish. Options (see the README for all of them):
+#   topic placeholders: {dto} (imu), {packet_type} (01), {client_id}
+#   format: "json" (envelope + data) or "binary" (u32 number | u64 timestamp | serial packet)
+#
+# [handlers.mqtt]
+# class = "serial_receiver.handlers.mqtt.mqtt_packet_handler:MqttPacketHandler"
+# [handlers.mqtt.options]
+# client_id   = "serial-receiver-1"   # unique per broker connection: one per receiver instance
+# broker_host = "localhost"
+# broker_port = 1883
+# topic       = "iot/serial/{dto}"
+# format      = "json"
+# qos         = 0
+# # username = "user"
+# # password_env = "MQTT_PASSWORD"    # password read from this environment variable
+
+# ---------------------------------------------------------------------------------------------
 # One [[packets]] block per packet type the sender sends.
 #   type     : the packet's first byte, as sent by the sender
 #   dto      : "package.module:Class" of the PacketDto subclass the payload is deserialized into;
 #              its LAYOUT must match the bytes the sender puts between the type byte and the CRC
-#   handlers : what to do with each decoded packet, in order. Either a class path, or
-#              { class = "package.module:Class", options = { ...constructor kwargs... } }
+#   handlers : what to do with each decoded packet, in order. Each entry is a [handlers.*] name,
+#              a class path, or { class = "package.module:Class", options = { ... } }
+#              (the last two create a new instance for this block only).
 #              An empty list decodes the packet (and validates it) without doing anything with it.
+# ---------------------------------------------------------------------------------------------
 [[packets]]
 type = 0x01
 dto = "serial_receiver.dto.imu_dto:ImuDto"
-handlers = [
-    { class = "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler", options = { level = "INFO" } },
-]
+handlers = ["log"]

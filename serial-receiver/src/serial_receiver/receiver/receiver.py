@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import time
 
@@ -11,6 +12,7 @@ from serial_receiver.handlers.packet_dispatcher import PacketDispatcher
 from serial_receiver.protocol import cobs
 from serial_receiver.protocol.cobs_decode_error import CobsDecodeError
 from serial_receiver.protocol.frame_splitter import FrameSplitter
+from serial_receiver.receiver.packet_counter import PacketCounter
 from serial_receiver.receiver.receiver_stats import ReceiverStats
 from serial_receiver.receiver.serial_port import open_serial_port
 
@@ -38,12 +40,16 @@ class Receiver:
             _handle_frame(frame)
               cobs.decode(frame)         -> payload
               decoder.decode(payload)    -> Packet
+              stamp number + received_at_ms on it
               dispatcher.dispatch(pkt)   -> PacketHandler.handle(pkt) per bound handler
             or, if any step raised:
               _on_discard(frame, exc)    -> ReceiverStats / log
 
     Handlers therefore run synchronously inside the read loop, and a slow handler
     slows down reading (bytes queue up in the OS buffer meanwhile).
+
+    Call close() when done (the CLI does, in a finally block): it lets handlers
+    release their resources, e.g. disconnect from an MQTT broker.
     """
 
     def __init__(
@@ -61,6 +67,7 @@ class Receiver:
         self._stats_interval_s = stats_interval_s  # <= 0 disables the periodic "Stats:" line
         self.stats = ReceiverStats()  # cumulative over the whole run, across reconnects
         self._synced = False  # becomes True on the first valid packet of each connection
+        self._counter = PacketCounter()  # per-type Packet.number, for the whole run
 
     def run_forever(self) -> None:
         """Reads until interrupted (KeyboardInterrupt propagates to the caller).
@@ -116,7 +123,17 @@ class Receiver:
                 self._synced = True
                 log.info("In sync: first valid packet received")
             self.stats.packets += 1
+            # Receive metadata, so handlers don't each need to track it.
+            packet = dataclasses.replace(
+                packet,
+                number=self._counter.next(packet.packet_type),
+                received_at_ms=time.time_ns() // 1_000_000,
+            )
             self._dispatcher.dispatch(packet)
+
+    def close(self) -> None:
+        """Releases the handlers' resources (see PacketDispatcher.close). Call once, at shutdown."""
+        self._dispatcher.close()
 
     def _on_discard(self, frame: bytes, exc: Exception) -> None:
         """Counts and logs a frame that didn't decode, by cause."""

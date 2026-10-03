@@ -2,8 +2,9 @@
 
 Reads a binary stream from a serial port, splits it into frames on `0x00`,
 COBS-decodes them, verifies the CRC-16, deserializes each payload into the **DTO**
-configured for its packet type, and passes it to the configured **handlers**
-(by default: log it to the console).
+configured for its packet type, and passes it to the configured **handlers**.
+Two handlers are built in: one **logs** each packet to the console, the other
+**publishes** it to an **MQTT broker** as JSON or binary. You can add your own.
 
 It works with any sender that speaks the protocol and isn't tied to any particular
 hardware. The protocol itself (packet format, CRC, COBS, byte-level example, sequence
@@ -13,6 +14,8 @@ diagrams) is documented in the [root README](../README.md#protocol).
 [Run](#run) ·
 [Architecture](#architecture) ·
 [Configuration](#configuration-which-dto-which-handlers) ·
+[Built-in handlers](#built-in-handlers) ·
+[MQTT handler](#mqtt-handler) ·
 [Adding a packet type](#adding-a-packet-type) ·
 [Writing a handler](#writing-a-handler) ·
 [Device discovery](#device-discovery) ·
@@ -42,6 +45,24 @@ uv run serial-receiver --log-level DEBUG     # also shows the garbage discarded 
 
 A setting given on the command line wins over `receiver.toml`, which wins over the built-in default.
 
+### Several devices
+
+One instance reads **one** serial port. For several devices, run one instance per port:
+
+```bash
+uv run serial-receiver -p /dev/cu.usbserial-A                     # terminal 1, e.g. an ESP32 at 921600
+uv run serial-receiver -p /dev/cu.usbserial-B -c arduino.toml     # terminal 2, e.g. an Arduino at 115200
+```
+
+- Always set the port (`-p` or `[serial] port`). Without it, discovery finds several
+  ports with decodable packets and stops with an error, instead of guessing.
+- Use a separate config (`-c`) when devices differ in baud rate or packet types.
+- Instances share nothing: statistics, reconnection and handlers are per instance.
+  Handlers that write to files should get a different file per instance (via `options`),
+  or lines from different processes may interleave.
+- Log lines don't name the device. Which device a line comes from is only known from
+  the instance (terminal) that printed it.
+
 ## Architecture
 
 The code is split into packages by topic, with one class per file. The first
@@ -65,9 +86,11 @@ flowchart TB
         SER["serial port<br/>(open_serial_port)"] -- "bytes" --> FS["protocol.FrameSplitter<br/>feed()"]
         FS -- "frame" --> CB["protocol.cobs<br/>decode()"]
         CB -- "payload" --> PD["decoding.PacketDecoder<br/>decode()"]
-        PD -- "Packet(type, dto)" --> PDS["handlers.PacketDispatcher<br/>dispatch()"]
-        PDS -- "handle(packet)" --> H1["LoggingPacketHandler"]
-        PDS -- "handle(packet)" --> H2["your handler…"]
+        PD -- "Packet(type, dto)" --> NUM["Receiver stamps<br/>number + received_at_ms"]
+        NUM --> PDS["handlers.PacketDispatcher<br/>dispatch()"]
+        PDS -- "handle(packet)" --> H1["LoggingPacketHandler<br/>console"]
+        PDS -- "handle(packet)" --> H2["MqttPacketHandler<br/>→ broker"]
+        PDS -- "handle(packet)" --> H3["your handler…"]
         CB -. "CobsDecodeError" .-> ST["ReceiverStats<br/>+ log"]
         PD -. "PacketError" .-> ST
     end
@@ -79,9 +102,11 @@ flowchart TB
 ### Who calls whom
 
 1. **Startup.** `cli.main()` parses the arguments and calls `load_config()`. The loader
-   reads `receiver.toml`. For each `[[packets]]` block it imports the DTO class and the
-   handler classes from their `"package.module:Class"` paths, validates them, and
-   instantiates the handlers with their `options`. The result is a frozen `ReceiverConfig`.
+   reads `receiver.toml`. For each `[[packets]]` block it imports the DTO class from its
+   `"package.module:Class"` path, validates it, and resolves the block's handlers: a
+   named handler (`[handlers.<name>]`) is instantiated once, on first use, and shared
+   with every other block that lists it, while a class path creates a new instance.
+   Handlers get their `options` as constructor arguments. The result is a frozen `ReceiverConfig`.
    `build_receiver()` then splits each binding in two:
    - type → DTO class goes into a `DtoRegistry`, wrapped by a `PacketDecoder`;
    - type → handlers goes into a `PacketDispatcher`.
@@ -95,25 +120,33 @@ flowchart TB
    `_handle_frame()` runs `cobs.decode()` and then `PacketDecoder.decode()`. The decoder
    checks the CRC, looks up the type byte in the registry, checks the size and calls
    `Dto.from_bytes()`. The result is a `Packet(packet_type, dto)`.
-4. **Callbacks.** `PacketDispatcher.dispatch(packet)` calls `handle(packet)` on every
+4. **Receive metadata.** Before dispatching, the receiver stamps the packet with
+   `number`, a per-type sequence number from a `PacketCounter`, and `received_at_ms`, the
+   wall-clock receive time. Every handler gets both, e.g. for the MQTT payload.
+5. **Callbacks.** `PacketDispatcher.dispatch(packet)` calls `handle(packet)` on every
    handler bound to that type, **synchronously, on the read thread**, in config order.
    A handler that raises is logged and skipped. It never stops the stream or the
    other handlers.
-5. **Failures.** Any step can reject a frame: `CobsDecodeError`, or a `PacketError`
+6. **Failures.** Any step can reject a frame: `CobsDecodeError`, or a `PacketError`
    subclass (CRC mismatch, unknown type, wrong length). `_on_discard()` counts it in
    `ReceiverStats` and logs it. Before the first valid packet, rejected frames are
    expected noise: they're logged at DEBUG and counted separately (see [sync](#logs-and-statistics)).
-6. **Errors on the port** (device unplugged or reset): `SerialException` is caught by
+7. **Errors on the port** (device unplugged or reset): `SerialException` is caught by
    `run_forever()`, which waits 2 s and reopens the port. The new connection starts
    unsynced again.
+8. **Shutdown.** On exit (Ctrl+C), the CLI calls `Receiver.close()` →
+   `PacketDispatcher.close()`, which calls `close()` once on every distinct handler, so the
+   MQTT handler can disconnect from its broker.
 
 ### Threads
 
-The receiver is **single-threaded**: reading, decoding and all handlers run on the
-main thread. Only discovery uses threads: `_probe_all()` runs one daemon thread per
-port, with a shared deadline, so a port that hangs can't block it. A slow handler
-(network, disk) delays reading. If you need one, hand the work off to a queue or a
-thread inside the handler.
+The receiver is **single-threaded**: reading, decoding and every `handle()` call run on
+the main thread. A slow handler (network, disk) therefore delays reading, so slow work
+belongs in a thread of the handler's own. That's what the MQTT handler does: paho's network
+loop runs in a background thread, and `handle()` only queues the message.
+
+Discovery also uses threads: `_probe_all()` runs one daemon thread per port, with a shared
+deadline, so a port that hangs can't block it.
 
 ### Extension points
 
@@ -122,6 +155,7 @@ thread inside the handler.
 | what a packet type is decoded into | a DTO in `dto/` + `receiver.toml` | decoder, receiver |
 | what happens to decoded packets | a `PacketHandler` + `receiver.toml` | everything else |
 | which packet types are accepted | `[[packets]]` blocks in `receiver.toml` | code |
+| how a packet is turned into bytes for publishing | a `PayloadEncoder` in `serialization/` | handlers that use it |
 | the wire format (COBS, CRC) | `protocol/` (and the sender) | DTOs, handlers |
 
 ## Configuration: which DTO, which handlers
@@ -138,22 +172,43 @@ baud = 921600                # must match the sender's baud rate
 [stats]
 interval_s = 5.0             # 0 disables the periodic stats line
 
+# Named handlers: created once, shared by every [[packets]] block that lists them.
+[handlers.log]
+class = "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler"
+[handlers.log.options]
+level = "INFO"
+
+[handlers.mqtt]
+class = "serial_receiver.handlers.mqtt.mqtt_packet_handler:MqttPacketHandler"
+[handlers.mqtt.options]
+client_id   = "serial-receiver-1"
+broker_host = "localhost"
+topic       = "iot/serial/{dto}"
+
 [[packets]]
 type = 0x01                  # the packet's first byte, as sent by the sender
 dto = "serial_receiver.dto.imu_dto:ImuDto"
-handlers = [
-    "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler",
-    { class = "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler", options = { level = "DEBUG" } },
-]
+handlers = ["log", "mqtt"]
 ```
 
-- `handlers` entries are either a class path, or `{ class = ..., options = {...} }`.
-  `options` are passed to the constructor as keyword arguments.
+Each entry in a block's `handlers` list is one of:
+
+| Entry | Means |
+|---|---|
+| `"log"` (a bare name) | The `[handlers.log]` instance. It's **created once, on first use, and shared** by every block that lists it. That matters for handlers holding a connection: one MQTT client for all packet types, instead of one per type fighting over the same client id. |
+| `"pkg.mod:Class"` | A new instance, without options, for this block only. |
+| `{ class = "pkg.mod:Class", options = {...} }` | A new instance with options, for this block only. |
+
+- `options` are passed to the constructor as keyword arguments.
+- Names can't contain `:`, so a name and a class path are never ambiguous.
+- A named handler that no block uses isn't created at all (a warning says so), so a
+  configured but unused MQTT handler never connects to its broker.
 - `handlers = []` still decodes and validates the packet (it counts in the stats), but does nothing with it.
 - The same DTO can be bound to several types, e.g. two identical sensors.
-- Everything is validated **at startup**, with the block number in the message: wrong
-  path, a class that isn't a `PacketDto`/`PacketHandler`, a DTO whose `LAYOUT`
-  disagrees with its fields, bad handler options, a duplicate type, a type outside `0x00`–`0xFF`.
+- Everything is validated **at startup**, with the block or handler name in the message:
+  wrong path, a class that isn't a `PacketDto`/`PacketHandler`, a DTO whose `LAYOUT`
+  disagrees with its fields, bad handler options, an unknown handler name, a duplicate
+  type, a type outside `0x00`–`0xFF`.
 
 The same wiring can be done in code, without a config file:
 
@@ -162,7 +217,239 @@ registry = DtoRegistry()
 registry.register(0x01, ImuDto)
 dispatcher = PacketDispatcher()
 dispatcher.register(0x01, LoggingPacketHandler())
-Receiver("/dev/ttyUSB0", 921600, PacketDecoder(registry), dispatcher).run_forever()
+receiver = Receiver("/dev/ttyUSB0", 921600, PacketDecoder(registry), dispatcher)
+try:
+    receiver.run_forever()
+finally:
+    receiver.close()   # handlers release their resources (e.g. the MQTT connection)
+```
+
+## Built-in handlers
+
+| Handler | Class | What it does | Options |
+|---|---|---|---|
+| **Logging** | `serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler` | Logs each packet's DTO (its `__str__`) to the console. | `level`: log level name or number (default `"INFO"`) |
+| **MQTT** | `serial_receiver.handlers.mqtt.mqtt_packet_handler:MqttPacketHandler` | Publishes each packet to an MQTT broker, as JSON or binary. | see [MQTT handler](#mqtt-handler) |
+
+Both work with any packet type, with no per-type code. The logging handler prints whatever
+the DTO's `__str__` returns, and the MQTT handler builds topic and payload from the packet
+and its DTO. For anything else (a CSV file, a database, an HTTP API), see
+[Writing a handler](#writing-a-handler).
+
+## MQTT handler
+
+`MqttPacketHandler` publishes every packet it receives to an MQTT broker. It's built on
+[paho-mqtt](https://pypi.org/project/paho-mqtt/) 2.x.
+
+```mermaid
+flowchart LR
+    P["Packet<br/>type · dto<br/>number · received_at_ms"] --> T["TopicTemplate<br/>iot/serial/{dto}"]
+    P --> E["PayloadEncoder<br/>json | binary"]
+    T -- "topic: iot/serial/imu" --> PUB["paho client.publish()<br/>(background network thread)"]
+    E -- "payload bytes" --> PUB
+    PUB --> B[("MQTT broker")]
+```
+
+For each packet, the handler renders the **topic** from a template, encodes the
+**payload** in the configured format, and hands both to paho, which sends them from its own
+thread.
+
+### Quick start
+
+1. Run a broker, e.g. Mosquitto: `brew install mosquitto` (macOS), then `mosquitto -v`.
+2. In `receiver.toml`, uncomment the `[handlers.mqtt]` block (it ships commented out,
+   so the receiver runs without a broker) and add `"mqtt"` to the packet types to publish:
+
+   ```toml
+   [handlers.mqtt]
+   class = "serial_receiver.handlers.mqtt.mqtt_packet_handler:MqttPacketHandler"
+   [handlers.mqtt.options]
+   client_id   = "serial-receiver-1"
+   broker_host = "localhost"
+   broker_port = 1883
+   topic       = "iot/serial/{dto}"
+   format      = "json"
+   qos         = 0
+
+   [[packets]]
+   type = 0x01
+   dto = "serial_receiver.dto.imu_dto:ImuDto"
+   handlers = ["log", "mqtt"]
+   ```
+
+3. Start the receiver (`uv run serial-receiver -p <port>`) and watch the messages:
+
+   ```bash
+   mosquitto_sub -h localhost -t 'iot/#' -v
+   ```
+
+   ```
+   iot/serial/imu {"packet_number":1,"received_timestamp":1791042044702,"packet_type":1,"dto":"ImuDto","data":{"timestamp_ms":94,"ax":0.1455181,"ay":0.478356,"az":9.81}}
+   iot/serial/imu {"packet_number":2,"received_timestamp":1791042044712,"packet_type":1,"dto":"ImuDto","data":{"timestamp_ms":104,"ax":0.1604718,"ay":0.4735492,"az":9.81}}
+   ```
+
+Define the handler **once**, as a named handler, and list it in every packet type to
+publish. All types then share one client and one connection. Two instances with the same
+`client_id` would keep disconnecting each other.
+
+### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `client_id` | *required* | MQTT client identifier. Must be **unique per broker connection**, so use one per receiver instance. |
+| `broker_host` | *required* | Broker host name or IP. |
+| `broker_port` | `1883` | Broker port. |
+| `topic` | *required* | Destination topic, a template (see [Topic](#topic)). |
+| `format` | `"json"` | `"json"` or `"binary"` (see [Payload](#payload)). |
+| `qos` | `0` | `0` at most once, `1` at least once, `2` exactly once. |
+| `retain` | `false` | Ask the broker to retain the last message on each topic. |
+| `keepalive_s` | `60` | MQTT keepalive interval, in seconds. |
+| `username` | none | Username, if the broker requires authentication. |
+| `password_env` | none | Name of the **environment variable** holding the password, so it stays out of the config file. Requires `username`. |
+| `max_queued_messages` | `1000` | QoS 1/2 messages kept in memory while disconnected (`0` = unlimited). |
+| `float_digits` | `7` | JSON only: significant digits for floats (see [Payload](#payload)). |
+
+All options are validated at startup. An unknown option, a bad value, an unset
+`password_env` variable or a bad topic template is reported as a config error, before
+anything connects.
+
+### Topic
+
+`topic` is a template with these placeholders:
+
+| Placeholder | Becomes | Example |
+|---|---|---|
+| `{dto}` | the DTO class name, lowercased, without the `Dto` suffix | `ImuDto` → `imu` |
+| `{packet_type}` | the type byte, two hex digits | `01` |
+| `{client_id}` | the handler's client id | `serial-receiver-1` |
+
+| Template | IMU packet (type `0x01`, `ImuDto`) goes to |
+|---|---|
+| `iot/serial/{dto}` | `iot/serial/imu` |
+| `iot/{client_id}/{packet_type}` | `iot/serial-receiver-1/01` |
+| `iot/esp32-a/{dto}` | `iot/esp32-a/imu` (the device named by hand) |
+| `iot/serial/all` | `iot/serial/all` (every type on one topic: use the `dto` field to tell them apart) |
+
+Unknown placeholders and the MQTT wildcards `+`/`#` are rejected at startup. With several
+devices (one receiver instance each), give each instance its own `client_id` and put the
+device in the topic, either by hand or with `{client_id}`.
+
+### Payload
+
+Every message carries the same information, in either format:
+
+| Field | From | Meaning |
+|---|---|---|
+| `packet_number` | `Packet.number` | Sequence number **per packet type**, assigned by the receiver: the n-th IMU packet, the n-th ENV packet... It's not reset when the serial port reconnects, and a gap means packets of that type were lost after decoding. |
+| `received_timestamp` | `Packet.received_at_ms` | When the receiver decoded it, in **ms since the Unix epoch** (PC clock). The device's own timestamp, if it has one, stays inside `data`. |
+| `packet_type`, `dto` | `Packet` | What `data` is. |
+| `data` | `Packet.dto` | The packet as received on the serial line. |
+
+The two formats below encode the same IMU packet: `timestamp_ms = 1000`, `ax = 0.5`,
+`ay = -0.25`, `az = 9.81`, received as the 42nd IMU packet at `1791042044608` ms. The bytes
+are the real output of the encoders.
+
+**`format = "json"`**: a compact UTF-8 JSON object (shown indented here):
+
+```json
+{
+  "packet_number": 42,
+  "received_timestamp": 1791042044608,
+  "packet_type": 1,
+  "dto": "ImuDto",
+  "data": {"timestamp_ms": 1000, "ax": 0.5, "ay": -0.25, "az": 9.81}
+}
+```
+
+- `data` comes from `PacketDto.to_dict()`, which returns every dataclass field under its
+  own name by default. Override it in a DTO to rename fields, convert units or add derived
+  values in the JSON, without touching the binary layout:
+
+  ```python
+  def to_dict(self) -> dict[str, object]:
+      return {"t_ms": self.timestamp_ms, "accel_g": [self.ax / 9.81, self.ay / 9.81, self.az / 9.81]}
+  ```
+
+- Floats are rounded to `float_digits` significant digits. Packet fields are float32, and
+  `9.81` read back as float32 is `9.8100004196167`. 7 digits is all float32 carries, so
+  rounding restores `9.81`. Use a lower value (e.g. `4`) for shorter messages, or `17` to
+  publish the exact float32 value.
+
+**`format = "binary"`**: a fixed 12-byte header followed by the serial packet, 31 bytes for IMU:
+
+| Offset | Size | Field | Encoding | Example bytes |
+|---:|---:|---|---|---|
+| 0 | 4 | `packet_number` | `uint32` LE, wraps after 2³²−1 | `2A 00 00 00` (42) |
+| 4 | 8 | `received_timestamp` | `uint64` LE, ms since the Unix epoch | `C0 C2 6C 02 A1 01 00 00` |
+| 12 | 19 | serial packet | type, fields and crc16, exactly as received, minus COBS (an MQTT message is already delimited) | `01 E8 03 00 00 00 00 00 3F 00 00 80 BE C3 F5 1C 41 22 80` |
+
+The serial packet part is the same 19 bytes as in the root README's
+[packet example](../README.md#1-imu-sample-typical-values), so the CRC still protects it end to end.
+
+### Consuming the messages
+
+A subscriber needs nothing from this project for JSON. For binary, it unpacks the header
+and decodes the rest with the same layout, or reuses the receiver's own decoder. The
+subscriber has to know which format a topic carries: the payload itself doesn't say
+(a binary message can start with any byte, `{` included).
+
+```python
+import json, struct
+import paho.mqtt.client as mqtt
+from serial_receiver.decoding import DtoRegistry, PacketDecoder
+from serial_receiver.dto.imu_dto import ImuDto
+
+registry = DtoRegistry()
+registry.register(0x01, ImuDto)
+decoder = PacketDecoder(registry)
+
+FORMAT = "json"   # must match the handler's `format`
+
+def on_message(client, userdata, msg):
+    if FORMAT == "json":
+        envelope = json.loads(msg.payload)
+        print(msg.topic, envelope["packet_number"], envelope["data"])
+    else:
+        number, received_ms = struct.unpack("<IQ", msg.payload[:12])
+        packet = decoder.decode(msg.payload[12:])                  # verifies the CRC too
+        print(msg.topic, number, received_ms, packet.dto)
+
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+client.on_message = on_message
+client.connect("localhost", 1883)
+client.subscribe("iot/#")
+client.loop_forever()
+```
+
+With `mosquitto_sub`, `-F '%t %l bytes: %x'` prints topic, length and hex of each binary message.
+
+### Delivery and connection
+
+- **Non-blocking.** paho's network loop runs in its own thread. `handle()` only queues
+  the message (`publish()` is thread-safe), so a slow or absent broker never slows down
+  serial reading.
+- **Startup doesn't wait for the broker.** The connection is opened in the background, and
+  paho reconnects on its own, waiting 1 to 30 s between attempts.
+- **While disconnected** (verified against a real broker):
+
+  | QoS | What happens to new messages |
+  |---|---|
+  | `0` | **Dropped.** They're counted, and a WARNING is logged at most every 10 s. |
+  | `1`, `2` | **Queued** in memory and delivered after reconnecting, up to `max_queued_messages`. Beyond that, dropped and counted. |
+
+  Use `qos = 1` if messages must survive a broker restart or a network outage. With
+  `qos = 0`, data published during the outage is lost (it's still visible in the log).
+- **Shutdown** (Ctrl+C): the receiver calls `close()` on its handlers, and the MQTT
+  handler disconnects cleanly.
+
+What the handler logs:
+
+```
+INFO    serial_receiver.handlers.mqtt.mqtt_packet_handler: MQTT serial-receiver-1 -> localhost:1883, topic 'iot/serial/{dto}', format json, qos 0
+INFO    serial_receiver.handlers.mqtt.mqtt_packet_handler: MQTT serial-receiver-1: connected to localhost:1883
+WARNING serial_receiver.handlers.mqtt.mqtt_packet_handler: MQTT serial-receiver-1: broker localhost:1883 unreachable, retrying in the background
+WARNING serial_receiver.handlers.mqtt.mqtt_packet_handler: MQTT serial-receiver-1: 120 message(s) dropped (The client is not currently connected.)
+INFO    serial_receiver.handlers.mqtt.mqtt_packet_handler: MQTT serial-receiver-1 closed: 4210 published, 120 dropped
 ```
 
 ## Adding a packet type
@@ -221,10 +508,15 @@ class CsvPacketHandler(PacketHandler):
 ```
 
 ```toml
-handlers = [
-    "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler",
-    { class = "my_project.csv_handler:CsvPacketHandler", options = { path = "imu.csv" } },
-]
+[handlers.csv]
+class = "my_project.csv_handler:CsvPacketHandler"
+[handlers.csv.options]
+path = "imu.csv"
+
+[[packets]]
+type = 0x01
+dto = "serial_receiver.dto.imu_dto:ImuDto"
+handlers = ["log", "csv"]
 ```
 
 Rules (see the [`PacketHandler`](src/serial_receiver/handlers/packet_handler.py) docstring):
@@ -233,6 +525,11 @@ Rules (see the [`PacketHandler`](src/serial_receiver/handlers/packet_handler.py)
 - An exception is logged and skipped. It doesn't stop the receiver.
 - One instance serves every type it's bound to. Check `packet.packet_type` if it matters.
 - `packet.dto` is frozen. Treat it as read-only.
+- `packet.number` (per-type sequence number) and `packet.received_at_ms` are set by the receiver.
+- Holding a resource (connection, open file)? Override `close()`. It's called once at shutdown,
+  even if the instance is shared by several packet types.
+- To publish packets as JSON or binary, reuse the encoders in `serialization/`
+  (`create_payload_encoder("json")`), as `MqttPacketHandler` does.
 
 ## Device discovery
 
@@ -327,16 +624,26 @@ src/serial_receiver/
     packet_dto.py               PacketDto: base class (LAYOUT <-> dataclass fields, startup validation)
     imu_dto.py                  ImuDto
   decoding/                   payload <-> Packet
-    packet.py                   Packet: packet type + DTO
+    packet.py                   Packet: packet type + DTO + receive metadata (number, received_at_ms)
     dto_registry.py             DtoRegistry: packet type -> DTO class
     packet_decoder.py           PacketDecoder: size, CRC, type lookup, length, from_bytes (in that order)
     errors/                     PacketError and its subclasses: CrcMismatch, UnknownPacketType, PacketLength
   handlers/                   what happens to decoded packets
-    packet_handler.py           PacketHandler: the callback interface
+    packet_handler.py           PacketHandler: the callback interface (handle, close)
     logging_packet_handler.py   LoggingPacketHandler
-    packet_dispatcher.py        PacketDispatcher: packet type -> handlers, error isolation
+    packet_dispatcher.py        PacketDispatcher: packet type -> handlers, error isolation, close
+    mqtt/                       publishing to an MQTT broker
+      mqtt_packet_handler.py      MqttPacketHandler: paho client, publish, drop accounting
+      mqtt_settings.py            MqttSettings: the handler's options, validated
+      topic_template.py           TopicTemplate: {dto} / {packet_type} / {client_id} placeholders
+  serialization/              Packet -> bytes for publishing (envelope: number, timestamp, data)
+    payload_encoder.py          PayloadEncoder: the interface
+    json_payload_encoder.py     JsonPayloadEncoder
+    binary_payload_encoder.py   BinaryPayloadEncoder: u32 number | u64 timestamp | serial packet
+    payload_encoder_factory.py  create_payload_encoder("json" | "binary")
   receiver/                   serial port side
-    receiver.py                 Receiver: read loop, sync phase, stats, reconnect
+    receiver.py                 Receiver: read loop, sync phase, packet metadata, stats, reconnect, close
+    packet_counter.py           PacketCounter: per-type sequence numbers
     receiver_stats.py           ReceiverStats
     serial_port.py              open_serial_port(): shared by Receiver and DeviceProber
   discovery/                  finding ports that carry decodable packets
@@ -347,7 +654,7 @@ src/serial_receiver/
     discovery_report.py         format_report(): the --discover output
     port_discovery_error.py     PortDiscoveryError
   config/                     receiver.toml -> wired Receiver
-    config_loader.py            load_config(): parsing, validation, dynamic class import
+    config_loader.py            load_config(): parsing, validation, named handlers, dynamic class import
     receiver_config.py          ReceiverConfig
     packet_binding_config.py    PacketBindingConfig: type + DTO class + handler instances
     receiver_factory.py         build_decoder() / build_receiver()
@@ -365,8 +672,10 @@ The tests follow the layout of `src/` and need no hardware: the serial port and
 `comports()` are replaced with fakes. They cover the CRC check value, COBS round
 trips and malformed frames, frame splitting across arbitrary chunk boundaries, the IMU
 wire layout, every decoder rejection path, DTO definition checks, dispatcher error
-isolation, config validation (including the shipped `receiver.toml`), and discovery
-(classification, parallel probing, blocked ports, the report).
+isolation and shutdown, config validation (including the shipped `receiver.toml` and
+shared named handlers), per-type packet numbering, the JSON and binary payloads, the MQTT
+handler (settings, topic templates, publish, drop accounting, with a fake paho client), and
+discovery (classification, parallel probing, blocked ports, the report).
 
 ## License
 

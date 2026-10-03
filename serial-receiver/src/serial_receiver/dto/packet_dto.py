@@ -32,6 +32,7 @@ class PacketDto:
         - decoding.PacketDecoder.decode() calls from_bytes() for every packet of a
           bound type, after the CRC and length checks have passed.
         - decoding.PacketDecoder.encode() calls to_bytes() to build a payload.
+        - serialization.JsonPayloadEncoder calls to_dict() for the published "data".
         - handlers receive the instance in Packet.dto. Overriding __str__ gives
           LoggingPacketHandler a readable line.
     """
@@ -46,6 +47,16 @@ class PacketDto:
     def to_bytes(self) -> bytes:
         """The field bytes, in dataclass field order: inverse of from_bytes()."""
         return self.LAYOUT.pack(*dataclasses.astuple(self))
+
+    def to_dict(self) -> dict[str, object]:
+        """The fields as a plain dict, for text formats (e.g. the "data" object of the
+        JSON payload published by the MQTT handler).
+
+        Default: every dataclass field under its own name. Override it to rename
+        fields, convert units or add derived values in the published data, without
+        touching the binary layout.
+        """
+        return dataclasses.asdict(self)
 
     @classmethod
     def check_definition(cls) -> None:

@@ -14,16 +14,32 @@ before a single byte is read.
     [stats]
     interval_s = 5.0                   # 0 disables the periodic stats line
 
+    [handlers.mqtt]                    # a named handler: one instance, shareable by several packet types
+    class = "serial_receiver.handlers.mqtt.mqtt_packet_handler:MqttPacketHandler"
+    [handlers.mqtt.options]
+    client_id = "serial-receiver-1"
+    ...
+
     [[packets]]
     type = 0x01                        # packet type byte, as sent by the sender
     dto = "serial_receiver.dto.imu_dto:ImuDto"
     handlers = [
-        "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler",
-        { class = "my_pkg.my_handler:MyHandler", options = { some_arg = 1 } },
+        "mqtt",                                                                # a named handler
+        "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler", # a new instance
+        { class = "my_pkg.my_handler:MyHandler", options = { some_arg = 1 } },  # a new instance
     ]
+
+Handler entries in [[packets]]:
+    "name"                         the [handlers.name] instance. Created once, on first use, and
+                                   shared by every packet type that lists it (e.g. one MQTT
+                                   connection). Names can't contain ':', so they never clash
+                                   with class paths.
+    "pkg.mod:Class"                a new instance, no options
+    { class = ..., options = ... } a new instance with options
 """
 
 import importlib
+import logging
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -33,6 +49,8 @@ from serial_receiver.config.packet_binding_config import PacketBindingConfig
 from serial_receiver.config.receiver_config import ReceiverConfig
 from serial_receiver.dto.packet_dto import PacketDto
 from serial_receiver.handlers.packet_handler import PacketHandler
+
+log = logging.getLogger(__name__)
 
 DEFAULT_BAUD = 921600  # must match the sender's baud rate
 DEFAULT_STATS_INTERVAL_S = 5.0
@@ -59,7 +77,13 @@ def load_config(path: Path) -> ReceiverConfig:
     if not packet_entries:
         raise ConfigError(f"{path}: no [[packets]] configured - nothing could be decoded")
 
-    bindings = tuple(_parse_binding(entry, index) for index, entry in enumerate(packet_entries))
+    named_specs = _parse_named_handlers(raw.get("handlers", {}))
+    named_instances: dict[str, PacketHandler] = {}  # filled on first use by _resolve_handler
+    bindings = tuple(
+        _parse_binding(entry, index, named_specs, named_instances) for index, entry in enumerate(packet_entries)
+    )
+    for name in sorted(set(named_specs) - set(named_instances)):
+        log.warning("[handlers.%s] is defined but no [[packets]] block uses it: not created", name)
     seen: set[int] = set()
     for binding in bindings:
         if binding.packet_type in seen:
@@ -74,9 +98,30 @@ def load_config(path: Path) -> ReceiverConfig:
     )
 
 
-def _parse_binding(entry: dict[str, Any], index: int) -> PacketBindingConfig:
+def _parse_named_handlers(section: Any) -> dict[str, dict[str, Any]]:
+    """The [handlers.<name>] tables -> {name: {class, options}}, shape-checked only.
+    Nothing is imported or instantiated here: that happens on first use."""
+    if not isinstance(section, dict):
+        raise ConfigError("[handlers] must be a table of named handlers: [handlers.<name>]")
+    for name, spec in section.items():
+        where = f"[handlers.{name}]"
+        if ":" in name:
+            raise ConfigError(f"{where}: handler names can't contain ':' (that's how class paths are told apart)")
+        if not isinstance(spec, dict) or "class" not in spec:
+            raise ConfigError(f"{where}: needs a 'class' key (and optionally an [handlers.{name}.options] table)")
+        if not isinstance(spec.get("options", {}), dict):
+            raise ConfigError(f"{where}: 'options' must be a table")
+    return section
+
+
+def _parse_binding(
+    entry: dict[str, Any],
+    index: int,
+    named_specs: dict[str, dict[str, Any]],
+    named_instances: dict[str, PacketHandler],
+) -> PacketBindingConfig:
     """One [[packets]] block -> PacketBindingConfig: validates the type byte, imports
-    and checks the DTO class, builds the handler instances."""
+    and checks the DTO class, resolves the handlers (named or new instances)."""
     where = f"[[packets]] #{index + 1}"
     for key in ("type", "dto"):
         if key not in entry:
@@ -94,8 +139,28 @@ def _parse_binding(entry: dict[str, Any], index: int) -> PacketBindingConfig:
     except TypeError as exc:
         raise ConfigError(f"{where}: {exc}") from None
 
-    handlers = tuple(_build_handler(spec, where) for spec in entry.get("handlers", []))
+    handlers = tuple(
+        _resolve_handler(spec, where, named_specs, named_instances) for spec in entry.get("handlers", [])
+    )
     return PacketBindingConfig(packet_type, dto_cls, handlers)
+
+
+def _resolve_handler(
+    spec: Any,
+    where: str,
+    named_specs: dict[str, dict[str, Any]],
+    named_instances: dict[str, PacketHandler],
+) -> PacketHandler:
+    """A bare name -> the shared [handlers.<name>] instance, created on first use.
+    Anything else (class path, inline table) -> a new instance via _build_handler."""
+    if isinstance(spec, str) and ":" not in spec:
+        if spec not in named_specs:
+            defined = ", ".join(sorted(named_specs)) or "none"
+            raise ConfigError(f"{where}: unknown handler name {spec!r} (defined [handlers.*]: {defined})")
+        if spec not in named_instances:
+            named_instances[spec] = _build_handler(named_specs[spec], f"[handlers.{spec}]")
+        return named_instances[spec]
+    return _build_handler(spec, where)
 
 
 def _build_handler(spec: str | dict[str, Any], where: str) -> PacketHandler:
@@ -108,7 +173,9 @@ def _build_handler(spec: str | dict[str, Any], where: str) -> PacketHandler:
     elif isinstance(spec, dict) and "class" in spec:
         class_path, options = spec["class"], spec.get("options", {})
     else:
-        raise ConfigError(f"{where}: a handler must be a class path or {{ class = ..., options = {{...}} }}")
+        raise ConfigError(
+            f"{where}: a handler must be a [handlers.*] name, a class path or {{ class = ..., options = {{...}} }}"
+        )
 
     handler_cls = _import_object(class_path, where)
     if not (isinstance(handler_cls, type) and issubclass(handler_cls, PacketHandler)):

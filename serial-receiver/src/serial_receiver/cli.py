@@ -88,6 +88,8 @@ def main() -> None:
         receiver.run_forever()
     except KeyboardInterrupt:
         log.info("Stopped. Final stats: %s", receiver.stats)
+    finally:
+        receiver.close()  # lets handlers release resources, e.g. disconnect from the MQTT broker
 
 
 def run_discovery(args: argparse.Namespace) -> None:

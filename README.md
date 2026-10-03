@@ -6,26 +6,31 @@ A serial communication protocol for IoT embedded devices, with its implementatio
   sensor and event data to a PC over a serial/USB link. **ESP32** is available today and
   **Arduino** (AVR) is coming next.
 - **A modular receiver in Python** that reads that stream from any client. Which data
-  structure each packet is decoded into, and what happens to it (logging, storage, …),
-  are set in configuration, with no code changes.
+  structure each packet is decoded into, and what happens to it (logging, publishing to an
+  MQTT broker as JSON or binary, …), are set in configuration, with no code changes.
 
-All clients speak the **same protocol**, so the receiver works with any of them without
+All clients speak the **same protocol**, so the same receiver works with any of them without
 knowing which board is on the other end. The client **pushes** binary packets as soon as
 they're ready. Each packet is protected by a **CRC-16** and framed with **COBS**, so `0x00`
 only ever appears as the frame delimiter.
 
 ```mermaid
 flowchart LR
-    E["ESP32 client<br/>esp32-serial-communicator"] -- "serial / USB" --> R["serial-receiver<br/>(Python, modular)"]
-    A["Arduino client<br/>(coming)"] -. "serial / USB" .-> R
-    R --> H["configurable handlers<br/>log · store · forward"]
+    E["ESP32 client<br/>esp32-serial-communicator"] -- "serial / USB<br/>port A" --> R1["serial-receiver<br/>instance 1 (-p port A)"]
+    A["Arduino client<br/>(coming)"] -. "serial / USB<br/>port B" .-> R2["serial-receiver<br/>instance 2 (-p port B)"]
+    R1 --> H1["configurable handlers<br/>console log · MQTT · custom"]
+    R2 --> H2["configurable handlers<br/>console log · MQTT · custom"]
 ```
+
+**One receiver instance reads one serial port.** To receive from several devices at once, run
+one instance per port (`-p`), each with its own config file if needed (`-c`). See
+[several devices](serial-receiver/README.md#several-devices) in the receiver README.
 
 | Subproject | Role | Status |
 |---|---|---|
 | [`esp32-serial-communicator/`](esp32-serial-communicator/) | **IoT client for ESP32**: firmware for an ESP32-C3 (PlatformIO + Arduino framework + PacketSerial). Two FreeRTOS tasks (producer/consumer) stream simulated IMU samples at 100 Hz. | available |
 | *Arduino client* | **IoT client for Arduino** (AVR: Uno, Nano, Mega): same protocol, single `loop()` without RTOS, lower baud rate. | coming |
-| [`serial-receiver/`](serial-receiver/) | **Modular receiver**: Python app (uv). Reads a serial port, decodes and validates frames, deserializes each payload into a configurable DTO, and dispatches it to configurable handlers. Hardware-agnostic. | available |
+| [`serial-receiver/`](serial-receiver/) | **Modular receiver**: Python app (uv). Reads a serial port, decodes and validates frames, deserializes each payload into a configurable DTO, and dispatches it to configurable handlers: logging and MQTT publishing (JSON or binary) built in. Hardware-agnostic. | available |
 
 This README describes the shared protocol, the reasoning behind it, the IMU example, and how
 to add new packet types. Each subproject has its own README for build and usage details.
@@ -118,7 +123,15 @@ handles COBS, the `0x00` delimiter and the packet-received callback.
 
 **Receiver.** COBS and the CRC are plain Python, with no dependency besides `pyserial` for the
 port. Which data structure each packet type is decoded into, and what happens to it, is set in
-a config file.
+a config file. What happens to a packet is up to **handlers**, chosen per packet type:
+
+| Handler | What it does |
+|---|---|
+| **Logging** (built in) | Prints each packet to the console. |
+| **MQTT** (built in) | Publishes each packet to an MQTT broker, as JSON or binary. Every message carries a per-type `packet_number`, the `received_timestamp` and the decoded `data`. See the [receiver's MQTT handler section](serial-receiver/README.md#mqtt-handler). |
+| **Custom** | Any class implementing `PacketHandler`, e.g. to write a CSV file, fill a database or call an HTTP API. See [Writing a handler](serial-receiver/README.md#writing-a-handler). |
+
+Several handlers can be attached to the same packet type, e.g. log and MQTT together.
 
 ### Building blocks
 
@@ -131,7 +144,7 @@ a config file.
 | Byte order | little-endian, packed structs | Native on ESP32 (Xtensa and RISC-V) and on x86/ARM PCs: no byte swapping. |
 | Baud rate | per client: 921600 on ESP32, 115200 on Arduino AVR (coming) | Each board uses the fastest rate its USB-UART bridge handles reliably (see [Physical link](#physical-link)). |
 | Concurrency | producer task + serial task + queue. Both on core 0 on the single-core ESP32-C3 | See the [firmware README](esp32-serial-communicator/README.md#how-it-works). |
-| Receiver | `serial-receiver` package: configurable DTOs and handlers, stats, discovery | See the [receiver README](serial-receiver/README.md). |
+| Receiver | `serial-receiver` package: configurable DTOs and handlers (console log and MQTT built in), stats, discovery | See the [receiver README](serial-receiver/README.md). |
 
 ---
 
@@ -150,7 +163,7 @@ flowchart LR
         direction TB
         D["split on 0x00"] --> E["COBS decode"]
         E --> F["check CRC · look up type<br/>· unpack into DTO"]
-        F --> G["handlers<br/>(log, store, ...)"]
+        F --> G["handlers<br/>(log, MQTT, ...)"]
     end
     C -- "UART / USB serial<br/>921600 baud, 8N1" --> D
 ```
@@ -625,7 +638,7 @@ connected yet, so `readImu()` in [`main.cpp`](esp32-serial-communicator/src/main
 | Wire layout | `struct ImuPacket` in `lib/framing/framing.h` | `ImuDto` in `dto/imu_dto.py` (`LAYOUT = "<Ifff"`) |
 | Type byte | `PACKET_TYPE_IMU = 0x01` | `type = 0x01` in `receiver.toml` |
 | Producing / consuming | `imuTask` → queue → `serialTask` → `sendImuPacket()` | `Receiver` → `PacketDecoder` → `PacketDispatcher` |
-| What happens to it | — | `LoggingPacketHandler` logs `ImuDto.__str__()` |
+| What happens to it | — | `LoggingPacketHandler` logs `ImuDto.__str__()`. Optionally, `MqttPacketHandler` publishes it to a broker as JSON or binary (see the [receiver README](serial-receiver/README.md#mqtt-handler)). |
 | Rate | `IMU_SAMPLE_PERIOD_MS` in `include/app_config.h` | measured in the `Stats:` line |
 
 **Making it real**: wire an IMU (e.g. an MPU6050 over I2C) and replace the body of
@@ -645,7 +658,8 @@ type**, defined on both sides. The general recipe:
    source. The serial task builds the struct, calls `framing_seal()` and sends it.
 4. **Receiver**: a new file in `serial_receiver/dto/` with a `PacketDto` dataclass
    whose `LAYOUT` matches the struct's fields (type byte and CRC excluded).
-5. **Receiver**: a `[[packets]]` block in `receiver.toml` binding the type byte to the DTO and to its handlers.
+5. **Receiver**: a `[[packets]]` block in `receiver.toml` binding the type byte to the DTO and to its handlers,
+   e.g. `handlers = ["log", "mqtt"]`. The MQTT handler publishes the new type with no extra code: its topic and payload are derived from the DTO.
 6. **Never change an existing layout in place.** If a layout must change, give it a new
    type byte. An old receiver then reports `unknown_type` instead of decoding garbage.
 
@@ -703,8 +717,11 @@ and bind it in `receiver.toml`:
 [[packets]]
 type = 0x02
 dto = "serial_receiver.dto.env_dto:EnvDto"
-handlers = ["serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler"]
+handlers = ["log", "mqtt"]   # the handlers defined in receiver.toml: console, and the broker if enabled
 ```
+
+With the MQTT handler enabled, ENV packets are published with no extra code, to
+`iot/serial/env` for a `"iot/serial/{dto}"` topic.
 
 ### B. Sparse events: BOOT button
 
