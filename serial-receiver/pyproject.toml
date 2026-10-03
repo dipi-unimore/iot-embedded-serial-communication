@@ -3,6 +3,7 @@ name = "serial-receiver"
 version = "0.1.0"
 description = "Receives COBS-framed, CRC-16-protected packets streamed over a serial port and dispatches them to configurable handlers"
 readme = "README.md"
+license = "MIT"
 authors = [
     { name = "Marco Picone", email = "picone.m@gmail.com" }
 ]

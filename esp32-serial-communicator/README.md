@@ -74,3 +74,7 @@ The full walkthrough, with environment-sensor and button examples on both sides,
 3. In `serialTask`, build the struct, call `framing_seal()` and `packetSerial.send()` it.
 4. Mirror the layout on the receiver side (a DTO + a `[[packets]]` entry) and add the
    type to the [packet type registry](../README.md#packet-type-registry).
+
+## License
+
+[MIT](../LICENSE) © Marco Picone ([picone.m@gmail.com](mailto:picone.m@gmail.com)), like the rest of the repository.

@@ -367,3 +367,7 @@ trips and malformed frames, frame splitting across arbitrary chunk boundaries, t
 wire layout, every decoder rejection path, DTO definition checks, dispatcher error
 isolation, config validation (including the shipped `receiver.toml`), and discovery
 (classification, parallel probing, blocked ports, the report).
+
+## License
+
+[MIT](../LICENSE) © Marco Picone ([picone.m@gmail.com](mailto:picone.m@gmail.com)), like the rest of the repository.

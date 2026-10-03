@@ -40,7 +40,8 @@ to add new packet types. Each subproject has its own README for build and usage 
 [Robustness](#robustness-what-happens-when-things-go-wrong) ·
 [The IMU example](#the-imu-example) ·
 [Extending to other examples](#extending-to-other-examples) ·
-[Packet type registry](#packet-type-registry)
+[Packet type registry](#packet-type-registry) ·
+[Author and license](#author-and-license)
 
 ---
 
@@ -754,3 +755,13 @@ Keep this table, `framing.h` and `receiver.toml` in sync.
 | `0x01` | IMU | device → PC | `timestamp: u32` (ms since boot), `ax, ay, az: f32` (m/s²) | 19 B | implemented (simulated data) |
 | `0x02` | ENV | device → PC | `timestamp: u32`, `temperature: f32` (°C), `humidity: f32` (%RH) | 15 B | example above, not implemented |
 | `0x03` | EVENT | device → PC | `timestamp: u32`, `pin: u8`, `state: u8` | 9 B | example above, not implemented |
+
+---
+
+## Author and license
+
+**Author:** Marco Picone ([picone.m@gmail.com](mailto:picone.m@gmail.com))
+
+Released under the [MIT License](LICENSE), a fully open-source license: you can use, copy,
+modify, merge, publish, distribute, sublicense and sell copies of the software, as long as
+the copyright and license notice are kept. The license covers every subproject in this repository.
