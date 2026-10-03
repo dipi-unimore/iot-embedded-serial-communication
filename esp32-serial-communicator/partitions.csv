@@ -1,0 +1,6 @@
+# Name,     Type, SubType,  Offset,   Size
+# Single factory app sized for a 2MB chip (no OTA): 1856K for the app, plus
+# ~128KB left unallocated at the end as headroom.
+nvs,        data, nvs,      0x9000,   0x6000
+phy_init,   data, phy,      0xf000,   0x1000
+factory,    app,  factory,  0x10000,  1856K

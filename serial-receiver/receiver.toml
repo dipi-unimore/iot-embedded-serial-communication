@@ -1,0 +1,23 @@
+# serial-receiver configuration. Every key here can be overridden from the CLI
+# (see `uv run serial-receiver --help`).
+
+[serial]
+# port = "/dev/ttyUSB0"              # omit to use the only port carrying decodable packets
+baud = 921600                        # must match the sender's baud rate
+
+[stats]
+interval_s = 5.0                     # how often to log throughput/error stats, 0 to disable
+
+# One [[packets]] block per packet type the sender sends.
+#   type     : the packet's first byte, as sent by the sender
+#   dto      : "package.module:Class" of the PacketDto subclass the payload is deserialized into;
+#              its LAYOUT must match the bytes the sender puts between the type byte and the CRC
+#   handlers : what to do with each decoded packet, in order. Either a class path, or
+#              { class = "package.module:Class", options = { ...constructor kwargs... } }
+#              An empty list decodes the packet (and validates it) without doing anything with it.
+[[packets]]
+type = 0x01
+dto = "serial_receiver.dto.imu_dto:ImuDto"
+handlers = [
+    { class = "serial_receiver.handlers.logging_packet_handler:LoggingPacketHandler", options = { level = "INFO" } },
+]
